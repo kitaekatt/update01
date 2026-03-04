@@ -3,19 +3,24 @@ set -euo pipefail
 
 # session-bootstrap.sh — SessionStart hook for setup plugin
 #
-# Always-run bootstrap — no cache check, no validation flag.
-# Runs step scripts unconditionally every session.
+# Runs bootstrap at most once every 24 hours. Checks a timestamp file
+# in plugin data dir; skips if last run was < 24h ago.
 #
+#   0. Check last-run timestamp (skip if recent)
 #   1. Verify system tools (currently no-op)
 #   2. Create/update Python venv (currently no-op)
 #   3. Ensure marketplace registrations with autoUpdate
 #   4. Force plugin cache refresh
+#   5. Write timestamp
 #
 # Output: Single JSON object to stdout (lands in additionalContext)
-# Exit:   0 = bootstrap complete, 1 = error
+# Exit:   0 = bootstrap complete (or skipped), 1 = error
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PLUGIN_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+PLUGIN_DATA="${HOME}/.claude/plugins/data/setup"
+TIMESTAMP_FILE="${PLUGIN_DATA}/last_bootstrap"
+THROTTLE_SECONDS=86400  # 24 hours
 
 # --- Source shared helpers and step functions ---
 
@@ -36,6 +41,28 @@ emit_hook_response() {
     cat <<EOF
 {"continue": true, "suppressOutput": false, "systemMessage": "$escaped_user", "hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": "$escaped_context"}}
 EOF
+}
+
+emit_hook_silent() {
+    cat <<EOF
+{"continue": true, "suppressOutput": true}
+EOF
+}
+
+# --- Throttle Helpers ---
+
+is_throttled() {
+    [ -f "$TIMESTAMP_FILE" ] || return 1
+    local last_run now elapsed
+    last_run=$(cat "$TIMESTAMP_FILE" 2>/dev/null) || return 1
+    now=$(date +%s)
+    elapsed=$((now - last_run))
+    [ "$elapsed" -lt "$THROTTLE_SECONDS" ]
+}
+
+write_timestamp() {
+    mkdir -p "$PLUGIN_DATA"
+    date +%s > "$TIMESTAMP_FILE"
 }
 
 # --- JSON Field Extractors ---
@@ -82,6 +109,12 @@ ${decoded}"
 # --- Main Bootstrap Flow ---
 
 main() {
+    # Step 0: Check throttle — skip if last run was < 24h ago
+    if is_throttled; then
+        emit_hook_silent
+        exit 0
+    fi
+
     # Step 1: Check system tools (no-op — always succeeds)
     local step1_json
     if ! step1_json=$(check_system_tools); then
@@ -109,6 +142,9 @@ main() {
         emit_hook_response "$(format_bootstrap_error_context "$step4_json")"
         exit 1
     fi
+
+    # Step 5: Write timestamp
+    write_timestamp
 
     # All steps passed
     emit_hook_response "setup -> ok"
