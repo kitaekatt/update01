@@ -41,7 +41,7 @@ update_plugins() {
 
     for plugin in "${plugins[@]}"; do
         local output rc
-        output=$(claude plugin update "$plugin" 2>&1) && rc=0 || rc=$?
+        output=$(claude plugin update --scope project "$plugin" 2>&1) && rc=0 || rc=$?
         if [ "$rc" -eq 0 ]; then
             results+=("$plugin: updated")
         else
