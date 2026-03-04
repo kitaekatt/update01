@@ -33,6 +33,23 @@ _emit_up_error() {
 EOF
 }
 
+_detect_plugin_scope() {
+    local plugin="$1"
+    local installed="${HOME}/.claude/plugins/installed_plugins.json"
+    [ -f "$installed" ] || return 1
+    python3 -c "
+import json, sys
+d = json.load(open('$installed'))
+entries = d.get('plugins', {}).get('$plugin', [])
+if isinstance(entries, list) and entries:
+    print(entries[0].get('scope', 'user'))
+elif isinstance(entries, dict):
+    print(entries.get('scope', 'user'))
+else:
+    print('user')
+" 2>/dev/null
+}
+
 update_plugins() {
     local results=()
     local plugins=(
@@ -40,8 +57,10 @@ update_plugins() {
     )
 
     for plugin in "${plugins[@]}"; do
+        local scope
+        scope="$(_detect_plugin_scope "$plugin")"
         local output rc
-        output=$(claude plugin update --scope project "$plugin" 2>&1) && rc=0 || rc=$?
+        output=$(claude plugin update --scope "$scope" "$plugin" 2>&1) && rc=0 || rc=$?
         if [ "$rc" -eq 0 ]; then
             results+=("$plugin: updated")
         else
