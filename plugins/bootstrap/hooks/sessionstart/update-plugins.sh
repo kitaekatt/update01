@@ -36,15 +36,18 @@ EOF
 update_plugins() {
     local results=()
     local plugins=(
-        "bootstrap@update01"
         "unreal-kit@plugins-kit"
     )
 
     for plugin in "${plugins[@]}"; do
-        if claude plugin update "$plugin" >/dev/null 2>&1; then
+        local output rc
+        output=$(claude plugin update "$plugin" 2>&1) && rc=0 || rc=$?
+        if [ "$rc" -eq 0 ]; then
             results+=("$plugin: updated")
         else
-            results+=("$plugin: skipped")
+            local trimmed
+            trimmed="$(printf '%s' "$output" | head -1 | cut -c1-80)"
+            results+=("$plugin: failed(rc=$rc${trimmed:+: $trimmed})")
         fi
     done
 

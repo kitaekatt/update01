@@ -111,7 +111,7 @@ ${decoded}"
 main() {
     # Step 0: Check throttle — skip if last run was < 16h ago
     if is_throttled; then
-        emit_hook_response "bootstrap -> ok (cached)"
+        emit_hook_silent
         exit 0
     fi
 
@@ -146,8 +146,24 @@ main() {
     # Step 5: Write timestamp
     write_timestamp
 
-    # All steps passed
-    emit_hook_response "bootstrap -> ok"
+    # All steps passed — build summary from step results
+    local details=()
+    local km_action
+    km_action="$(_extract_json_field "$step3_json" "action")"
+    [ "$km_action" = "updated" ] && details+=("synced marketplaces")
+
+    local up_details
+    up_details="$(_extract_json_field "$step4_json" "details")"
+    [ -n "$up_details" ] && details+=("plugins: ${up_details}")
+
+    local summary
+    if [ ${#details[@]} -gt 0 ]; then
+        summary="$(IFS='; '; printf '%s' "${details[*]}")"
+    else
+        summary="checked marketplaces and plugins"
+    fi
+
+    emit_hook_response "bootstrap -> ok (${summary})" "bootstrap -> ${summary}"
 }
 
 main
