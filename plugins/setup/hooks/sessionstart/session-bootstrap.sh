@@ -109,9 +109,9 @@ ${decoded}"
 # --- Main Bootstrap Flow ---
 
 main() {
-    # Step 0: Check throttle — skip if last run was < 24h ago
+    # Step 0: Check throttle — skip if last run was < 16h ago
     if is_throttled; then
-        emit_hook_silent
+        emit_hook_response "setup -> ok (cached)"
         exit 0
     fi
 
