@@ -1,168 +1,194 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -uo pipefail
 
-# session-bootstrap.sh — SessionStart hook for bootstrap plugin
+# session-bootstrap.sh — Thin bash wrapper for the Python bootstrap engine.
 #
-# Runs bootstrap at most once every 24 hours. Checks a timestamp file
-# in plugin data dir; skips if last run was < 24h ago.
+# Resolves paths, guards for python3, then delegates to the engine.
+# Engine's stdout becomes the hook response (JSON with systemMessage).
 #
-#   0. Check last-run timestamp (skip if recent)
-#   1. Verify system tools (currently no-op)
-#   2. Create/update Python venv (currently no-op)
-#   3. Ensure marketplace registrations with autoUpdate
-#   4. Force plugin cache refresh
-#   5. Write timestamp
-#
-# Output: Single JSON object to stdout (lands in additionalContext)
-# Exit:   0 = bootstrap complete (or skipped), 1 = error
+# NOTE: We intentionally do NOT use set -e. With -e, any unexpected command
+# failure causes silent exit with no JSON output, and Claude Code shows nothing.
+# Instead, we handle errors explicitly and ensure JSON is always emitted.
+
+# Safety net: if the script exits without producing output, emit minimal JSON
+HOOK_OUTPUT_EMITTED=""
+trap '[ -z "$HOOK_OUTPUT_EMITTED" ] && echo "{\"continue\": true, \"suppressOutput\": false, \"systemMessage\": \"bootstrap: shell error\", \"hookSpecificOutput\": {\"hookEventName\": \"SessionStart\"}}"' EXIT
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PLUGIN_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 PLUGIN_DATA="${HOME}/.claude/plugins/data/bootstrap"
-TIMESTAMP_FILE="${PLUGIN_DATA}/last_bootstrap"
-THROTTLE_SECONDS=57600  # 16 hours
 
-# --- Source shared helpers and step functions ---
+# --- Capture hook input from stdin and record start time ---
+HOOK_INPUT=$(cat)
+HOOK_START_EPOCH=$(date +%s 2>/dev/null || echo "0")
 
-source "$SCRIPT_DIR/lib/bootstrap-helpers.sh"
-source "$SCRIPT_DIR/check-system-tools.sh"
-source "$SCRIPT_DIR/create-venv.sh"
-source "$SCRIPT_DIR/ensure-known-marketplaces.sh"
-source "$SCRIPT_DIR/update-plugins.sh"
+# --- Logging ---
+# Collect entries in memory; write as a block at the end (with header) only if non-empty.
+SHELL_LOG_ENTRIES=()
 
-# --- Hook Response Wrapper ---
-
-emit_hook_response() {
-    local context_message="$1"
-    local user_message="${2:-$1}"
-    local escaped_context escaped_user
-    escaped_context="$(json_escape "$context_message")"
-    escaped_user="$(json_escape "$user_message")"
-    cat <<EOF
-{"continue": true, "suppressOutput": false, "systemMessage": "$escaped_user", "hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": "$escaped_context"}}
-EOF
+log_entry() {
+    local msg="$1"
+    local ts
+    ts="$(date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || echo "unknown-time")"
+    SHELL_LOG_ENTRIES+=("[$ts] $msg")
 }
 
-emit_hook_silent() {
-    cat <<EOF
-{"continue": true, "suppressOutput": true}
-EOF
-}
-
-# --- Throttle Helpers ---
-
-is_throttled() {
-    [ -f "$TIMESTAMP_FILE" ] || return 1
-    local last_run now elapsed
-    last_run=$(cat "$TIMESTAMP_FILE" 2>/dev/null) || return 1
-    now=$(date +%s)
-    elapsed=$((now - last_run))
-    [ "$elapsed" -lt "$THROTTLE_SECONDS" ]
-}
-
-write_timestamp() {
+flush_log() {
+    # Write collected entries as a block with a "Shell" header, only if non-empty.
+    if [ ${#SHELL_LOG_ENTRIES[@]} -eq 0 ]; then
+        return
+    fi
+    local ts
+    ts="$(date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || echo "unknown-time")"
     mkdir -p "$PLUGIN_DATA"
-    date +%s > "$TIMESTAMP_FILE"
+    {
+        echo "--- Shell $ts ---"
+        for entry in "${SHELL_LOG_ENTRIES[@]}"; do
+            echo "$entry"
+        done
+    } >> "$PLUGIN_DATA/bootstrap.log"
 }
 
-# --- JSON Field Extractors ---
-
-_extract_json_field() {
-    local json="$1" field="$2"
-    printf '%s' "$json" | sed -n 's/.*"'"$field"'":[[:space:]]*"\([^"]*\)".*/\1/p'
-}
-
-# --- Output Helpers ---
-
-format_bootstrap_error_context() {
-    local step_json="$1"
-    local context_msg
-    context_msg="$(_extract_json_field "$step_json" "context_message")"
-    if [ -n "$context_msg" ]; then
-        local decoded
-        decoded="$(printf '%b' "$context_msg")"
-        printf '%s' "bootstrap -> Bootstrap failed:
-${decoded}"
-    else
-        local msg
-        msg="$(_extract_json_field "$step_json" "message")"
-        printf '%s' "bootstrap -> ERROR: $msg"
+# --- Read log_success_shell from config (pre-Python, so use grep) ---
+LOG_SUCCESS_SHELL="true"
+CONFIG_FILE="$PLUGIN_DATA/config.json"
+if [ -f "$CONFIG_FILE" ]; then
+    # Extract value: grep for the key, strip to true/false
+    val=$(grep -o '"log_success_shell"[[:space:]]*:[[:space:]]*[a-z]*' "$CONFIG_FILE" 2>/dev/null | grep -o '[a-z]*$' || echo "true")
+    if [ "$val" = "false" ]; then
+        LOG_SUCCESS_SHELL="false"
     fi
-}
+fi
 
-format_bootstrap_error_user() {
-    local step_json="$1"
-    local user_msg
-    user_msg="$(_extract_json_field "$step_json" "user_message")"
-    if [ -n "$user_msg" ]; then
-        local decoded
-        decoded="$(printf '%b' "$user_msg")"
-        printf '%s' "bootstrap -> Setup issues found:
-${decoded}"
-    else
-        local msg
-        msg="$(_extract_json_field "$step_json" "message")"
-        printf '%s' "bootstrap -> ERROR: $msg"
+# --- Find Python 3 ---
+# Validate each candidate by execution, not just PATH presence.
+# This handles Windows Store stubs (python3 in PATH but exits 126).
+# Include the standalone install path directly — hard links in ~/.local/bin
+# can't find stdlib, so we check the original install location.
+
+PYTHON=""
+STANDALONE_DIR="${HOME}/.local/share/python-standalone"
+CANDIDATES=(python3 python)
+# Add standalone install paths (platform-dependent)
+if [ -x "${STANDALONE_DIR}/python/python.exe" ]; then
+    CANDIDATES+=("${STANDALONE_DIR}/python/python.exe")
+elif [ -x "${STANDALONE_DIR}/python/install/bin/python3" ]; then
+    CANDIDATES+=("${STANDALONE_DIR}/python/install/bin/python3")
+fi
+
+for candidate in "${CANDIDATES[@]}"; do
+    if [ -x "$candidate" ] || command -v "$candidate" &>/dev/null; then
+        if "$candidate" -c "import sys; sys.exit(0 if sys.version_info[0] >= 3 else 1)" 2>/dev/null; then
+            PYTHON="$candidate"
+            PYTHON_PATH="$(command -v "$candidate" 2>/dev/null || echo "$candidate")"
+            break
+        fi
     fi
-}
+done
 
-# --- Main Bootstrap Flow ---
+# Log python3 success if found and logging enabled
+if [ -n "$PYTHON" ] && [ "$LOG_SUCCESS_SHELL" = "true" ]; then
+    log_entry "python3: ok - found at $PYTHON_PATH"
+fi
 
-main() {
-    # Step 0: Check throttle — skip if last run was < 16h ago
-    if is_throttled; then
+# --- Self-bootstrap Python via python-build-standalone ---
+# If no valid Python 3 is found, download a standalone build and install it
+# to the plugin data directory with a symlink in ~/.local/bin.
+
+if [ -z "$PYTHON" ]; then
+    log_entry "python3: not found in PATH, installing standalone"
+
+    PY_VERSION="3.12.9"
+    RELEASE_TAG="20250317"
+    INSTALL_DIR="${HOME}/.local/share/python-standalone"
+
+    # Detect platform
+    OS="$(uname -s)"
+    ARCH="$(uname -m)"
+
+    # Map to python-build-standalone target triple
+    if [[ "$OS" == "Darwin" ]]; then
+        if [[ "$ARCH" == "arm64" ]]; then
+            TRIPLE="aarch64-apple-darwin"
+        else
+            TRIPLE="x86_64-apple-darwin"
+        fi
+    elif [[ "$OS" == "Linux" ]]; then
+        if [[ "$ARCH" == "aarch64" ]]; then
+            TRIPLE="aarch64-unknown-linux-gnu"
+        else
+            TRIPLE="x86_64-unknown-linux-gnu"
+        fi
+    elif [[ "$OS" == MINGW* ]] || [[ "$OS" == MSYS* ]]; then
+        TRIPLE="x86_64-pc-windows-msvc"
+    else
+        log_entry "python3: FAILED - unsupported platform for auto-install ($OS)"
+        flush_log
+        HOOK_OUTPUT_EMITTED=1
+        cat <<'EOF'
+{"continue": true, "suppressOutput": false, "systemMessage": "bootstrap -> python3 not found and platform not supported for auto-install. Install Python 3 manually.", "hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": "bootstrap -> CRITICAL: python3 not found. Unsupported platform for auto-install. Install Python 3.x manually."}}
+EOF
         exit 0
     fi
 
-    # Step 1: Check system tools (no-op — always succeeds)
-    local step1_json
-    if ! step1_json=$(check_system_tools); then
-        emit_hook_response "$(format_bootstrap_error_context "$step1_json")" "$(format_bootstrap_error_user "$step1_json")"
+    ARCHIVE="cpython-${PY_VERSION}+${RELEASE_TAG}-${TRIPLE}-install_only_stripped.tar.gz"
+    URL="https://github.com/indygreg/python-build-standalone/releases/download/${RELEASE_TAG}/${ARCHIVE}"
+
+    log_entry "python3: downloading $ARCHIVE"
+
+    # Download and extract
+    mkdir -p "$INSTALL_DIR"
+    if ! curl -LsSf "$URL" | tar xz -C "$INSTALL_DIR" 2>/dev/null; then
+        log_entry "python3: FAILED - download error"
+        flush_log
+        HOOK_OUTPUT_EMITTED=1
+        cat <<'EOF'
+{"continue": true, "suppressOutput": false, "systemMessage": "bootstrap -> python3 not found and auto-install failed (download error). Install Python 3 manually.", "hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": "bootstrap -> CRITICAL: python3 not found. Auto-install download failed. Install Python 3.x manually."}}
+EOF
         exit 0
     fi
 
-    # Step 2: Create/update venv (no-op — always succeeds)
-    local step2_json
-    if ! step2_json=$(create_venv); then
-        emit_hook_response "$(format_bootstrap_error_context "$step2_json")"
-        exit 1
-    fi
-
-    # Step 3: Ensure known_marketplaces.json has marketplace entries
-    local step3_json
-    if ! step3_json=$(ensure_known_marketplaces "$PLUGIN_ROOT"); then
-        emit_hook_response "$(format_bootstrap_error_context "$step3_json")"
-        exit 1
-    fi
-
-    # Step 4: Force plugin cache refresh
-    local step4_json
-    if ! step4_json=$(update_plugins); then
-        emit_hook_response "$(format_bootstrap_error_context "$step4_json")"
-        exit 1
-    fi
-
-    # Step 5: Write timestamp
-    write_timestamp
-
-    # All steps passed — build summary from step results
-    local details=()
-    local km_action
-    km_action="$(_extract_json_field "$step3_json" "action")"
-    [ "$km_action" = "updated" ] && details+=("synced marketplaces")
-
-    local up_details
-    up_details="$(_extract_json_field "$step4_json" "details")"
-    [ -n "$up_details" ] && details+=("plugins: ${up_details}")
-
-    local summary
-    if [ ${#details[@]} -gt 0 ]; then
-        summary="$(IFS='; '; printf '%s' "${details[*]}")"
+    # Make standalone Python available for future sessions via ~/.local/bin
+    mkdir -p "${HOME}/.local/bin"
+    if [[ "$OS" == MINGW* ]] || [[ "$OS" == MSYS* ]]; then
+        PYTHON="${INSTALL_DIR}/python/python.exe"
+        # Windows: hard link via PowerShell (no elevation needed; same drive assumed)
+        WIN_SRC="$(cygpath -w "$PYTHON")"
+        WIN_DEST="$(cygpath -w "${HOME}/.local/bin/python3.exe")"
+        powershell.exe -Command "New-Item -ItemType HardLink -Path '$WIN_DEST' -Target '$WIN_SRC' -Force" > /dev/null
+        log_entry "python3: installed $PYTHON, linked to ~/.local/bin/python3.exe"
     else
-        summary="checked marketplaces and plugins"
+        PYTHON="${INSTALL_DIR}/python/install/bin/python3"
+        ln -sf "$PYTHON" "${HOME}/.local/bin/python3"
+        log_entry "python3: installed $PYTHON, linked to ~/.local/bin/python3"
     fi
+fi
 
-    emit_hook_response "bootstrap -> ok (${summary})" "bootstrap -> ${summary}"
-}
+# --- Extract hook input fields for logging ---
+HOOK_SOURCE=""
+HOOK_SESSION_ID=""
+HOOK_MODEL=""
+if command -v jq &>/dev/null && [ -n "$HOOK_INPUT" ]; then
+    HOOK_SOURCE=$(echo "$HOOK_INPUT" | jq -r '.source // empty' 2>/dev/null || true)
+    HOOK_SESSION_ID=$(echo "$HOOK_INPUT" | jq -r '.session_id // empty' 2>/dev/null || true)
+    HOOK_MODEL=$(echo "$HOOK_INPUT" | jq -r '.model // empty' 2>/dev/null || true)
+elif [ -n "$HOOK_INPUT" ]; then
+    # Fallback: grep for fields (no jq available)
+    HOOK_SOURCE=$(echo "$HOOK_INPUT" | grep -o '"source"[[:space:]]*:[[:space:]]*"[^"]*"' | grep -o '"[^"]*"$' | tr -d '"' || true)
+    HOOK_SESSION_ID=$(echo "$HOOK_INPUT" | grep -o '"session_id"[[:space:]]*:[[:space:]]*"[^"]*"' | grep -o '"[^"]*"$' | tr -d '"' || true)
+    HOOK_MODEL=$(echo "$HOOK_INPUT" | grep -o '"model"[[:space:]]*:[[:space:]]*"[^"]*"' | grep -o '"[^"]*"$' | tr -d '"' || true)
+fi
+if [ "$LOG_SUCCESS_SHELL" = "true" ]; then
+    log_entry "hook: source=$HOOK_SOURCE session=$HOOK_SESSION_ID model=$HOOK_MODEL"
+fi
 
-main
+# --- Flush shell log entries (if any) before handing off to engine ---
+flush_log
+
+# --- Invoke Engine ---
+
+HOOK_OUTPUT_EMITTED=1
+exec "$PYTHON" "${PLUGIN_ROOT}/engine/bootstrap_engine.py" \
+    --plugin-root "$PLUGIN_ROOT" \
+    --data-dir "$PLUGIN_DATA" \
+    --hook-start-epoch "$HOOK_START_EPOCH"

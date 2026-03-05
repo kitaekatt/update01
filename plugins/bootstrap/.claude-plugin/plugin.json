@@ -1,7 +1,7 @@
 {
   "name": "bootstrap",
   "version": "0.5.0",
-  "description": "Always-run bootstrap plugin that ensures marketplaces and plugins stay up to date",
+  "description": "Seed bootstrap plugin — installs plugins-kit marketplace and bootstrap plugin on team machines",
   "author": {"name": "Christina"},
-  "keywords": ["bootstrap", "auto-update"]
+  "keywords": ["bootstrap", "auto-update", "seed"]
 }
