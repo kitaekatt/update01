@@ -7,13 +7,13 @@
   },
   "plugins": [
     {
-      "name": "bootstrap",
-      "description": "Always-run bootstrap plugin that ensures marketplaces and plugins stay up to date",
+      "name": "update",
+      "description": "Always-run update plugin that ensures marketplaces and plugins stay up to date",
       "version": "0.9.0",
       "author": {
         "name": "Christina"
       },
-      "source": "./plugins/bootstrap",
+      "source": "./plugins/update",
       "category": "development"
     }
   ]

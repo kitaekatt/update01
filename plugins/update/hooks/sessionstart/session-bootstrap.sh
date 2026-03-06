@@ -31,8 +31,8 @@ done
 # Works for both dev layout (~/Dev/<marketplace>/plugins/bootstrap/)
 # and cache layout (~/.claude/plugins/cache/<marketplace>/bootstrap/<version>/).
 MARKETPLACE_NAME="$(basename "$(cd "$PLUGIN_ROOT/../.." && pwd)")"
-BOOTSTRAP_LABEL="${MARKETPLACE_NAME}:bootstrap"
-PLUGIN_DATA="${HOME}/.claude/plugins/data/${MARKETPLACE_NAME}/bootstrap"
+BOOTSTRAP_LABEL="${MARKETPLACE_NAME}:update"
+PLUGIN_DATA="${HOME}/.claude/plugins/data/${MARKETPLACE_NAME}/update"
 
 # Set trap after BOOTSTRAP_LABEL is defined so variable expands correctly
 # In console mode, no JSON safety net needed — plain text output
