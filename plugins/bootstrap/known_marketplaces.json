@@ -6,10 +6,10 @@
     },
     "autoUpdate": true
   },
-  "update01": {
+  "update03": {
     "source": {
       "source": "git",
-      "url": "https://github.com/kitaekatt/update01.git"
+      "url": "https://github.com/kitaekatt/update03.git"
     },
     "autoUpdate": true
   }
