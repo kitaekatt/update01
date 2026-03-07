@@ -58,9 +58,11 @@ def main():
     current_os = detect_os()
     log_success = config.get("log_success_checks", False) or args.verbose
     all_failures = []
-    # Two entry lists: actions always displayed, ok only if log_success
-    all_action_entries = []
-    all_ok_entries = []
+    # Bootstrap's own entries — written to bootstrap's log
+    bootstrap_action_entries = []
+    bootstrap_ok_entries = []
+    # Display sections: list of (header, action_entries, ok_entries)
+    display_sections = []
 
     # Detect marketplace name and plugin identity for log prefixes
     plugins_dir = os.path.dirname(plugin_root)
@@ -93,8 +95,8 @@ def main():
         action_entries = []
         ok_entries = []
         failures = _process_manifest(manifest, current_os, data_dir, plugin_root, action_entries, ok_entries)
-        all_action_entries.extend(action_entries)
-        all_ok_entries.extend(ok_entries)
+        bootstrap_action_entries.extend(action_entries)
+        bootstrap_ok_entries.extend(ok_entries)
 
         if failures:
             all_failures.extend(failures)
@@ -119,12 +121,15 @@ def main():
                 user_manifest, current_os, data_dir, plugin_root, action_entries, ok_entries,
                 plugin_name="user",
             )
-            all_action_entries.extend(f"user: {e}" for e in action_entries)
-            all_ok_entries.extend(f"user: {e}" for e in ok_entries)
+            bootstrap_action_entries.extend(f"user: {e}" for e in action_entries)
+            bootstrap_ok_entries.extend(f"user: {e}" for e in ok_entries)
             if failures:
                 all_failures.extend(failures)
             else:
                 write_cache(data_dir, [user_manifest_path])
+
+    # Add bootstrap's own section to display
+    display_sections.append((bootstrap_label, list(bootstrap_action_entries), list(bootstrap_ok_entries)))
 
     # Step 4: Process enabled plugins
     registry_path = os.path.join(plugins_dir, "installed_plugins.json")
@@ -144,12 +149,16 @@ def main():
         with open(plugin_manifest_path, "r") as f:
             plugin_manifest = json.load(f)
 
+        # Per-plugin entry lists
+        plugin_action_entries = []
+        plugin_ok_entries = []
+
         # Config phase runs outside the cache gate (config can change between sessions)
         config_section = plugin_manifest.get("config")
         if config_section:
             config_failures = _process_config(
                 config_section, plugin_data_dir, plugin_info.install_path,
-                all_action_entries, plugin_name=plugin_info.name,
+                plugin_action_entries, plugin_name=plugin_info.name,
             )
             if config_failures:
                 all_failures.extend(config_failures)
@@ -158,21 +167,25 @@ def main():
         compute_current_hash(plugin_data_dir, [plugin_manifest_path])
         if check_cache(plugin_data_dir, [plugin_manifest_path]):
             all_cached_entries.append(f"{plugin_info.name}: cached")
-            continue
-
-        action_entries = []
-        ok_entries = []
-        failures = _process_manifest(
-            plugin_manifest, current_os, plugin_data_dir, plugin_info.install_path,
-            action_entries, ok_entries, plugin_name=plugin_info.name,
-        )
-        all_action_entries.extend(f"{plugin_info.name}: {e}" for e in action_entries)
-        all_ok_entries.extend(f"{plugin_info.name}: {e}" for e in ok_entries)
-
-        if failures:
-            all_failures.extend(failures)
         else:
-            write_cache(plugin_data_dir, [plugin_manifest_path])
+            action_entries = []
+            ok_entries = []
+            failures = _process_manifest(
+                plugin_manifest, current_os, plugin_data_dir, plugin_info.install_path,
+                action_entries, ok_entries, plugin_name=plugin_info.name,
+            )
+            plugin_action_entries.extend(action_entries)
+            plugin_ok_entries.extend(ok_entries)
+
+            if failures:
+                all_failures.extend(failures)
+            else:
+                write_cache(plugin_data_dir, [plugin_manifest_path])
+
+        # Add plugin section to display
+        plugin_label = f"{plugin_info.name}@{plugin_info.version}" if plugin_info.version else plugin_info.name
+        plugin_display_header = f"{plugin_info.marketplace}:{plugin_label}" if plugin_info.marketplace else plugin_label
+        display_sections.append((plugin_display_header, list(plugin_action_entries), list(plugin_ok_entries)))
 
     # Step 5: Read shell log entries BEFORE writing engine entries to the log
     if not args.console:
@@ -180,37 +193,41 @@ def main():
     else:
         shell_content = ""  # Console mode: shell already printed its entries
 
-    # Step 6: Write ALL engine entries to log file (for debugging)
+    # Step 6: Write bootstrap's own entries to log file (for debugging)
     # Skip in console mode — no file writes
-    all_log_entries = all_action_entries + all_ok_entries + all_cached_entries
-    if all_log_entries and not args.console:
-        write_log_block(data_dir, "Engine", all_log_entries)
+    bootstrap_log_entries = bootstrap_action_entries + bootstrap_ok_entries + all_cached_entries
+    if bootstrap_log_entries and not args.console:
+        write_log_block(data_dir, bootstrap_label, bootstrap_log_entries)
 
-    # Step 7: Build display entries — actions always, ok only if log_success
-    display_entries = list(all_action_entries)
-    if log_success:
-        display_entries.extend(all_ok_entries)
-    # --verbose also includes cached entries
+    # Step 7: Build display from sections — actions always, ok only if log_success
+    # Each section with entries gets a header line
+    display_lines = []
+    for header, actions, oks in display_sections:
+        section_entries = list(actions)
+        if log_success:
+            section_entries.extend(oks)
+        if section_entries:
+            display_lines.append(f"--- {header} ---")
+            display_lines.extend(section_entries)
+    # --verbose also includes cached entries (appended without section header)
     if args.verbose:
-        display_entries.extend(all_cached_entries)
+        display_lines.extend(all_cached_entries)
 
     if args.console:
         # Console mode: plain text to stdout, no JSON
-        for entry in display_entries:
-            print(entry)
+        for line in display_lines:
+            print(line)
         if all_failures:
             print(f"\n{bootstrap_label} -> {len(all_failures)} failure(s):")
             for f in all_failures:
                 print(f"  - [{f['type']}] {f.get('name', f.get('message', ''))}")
         return
 
-    # Build final display: shell entries + engine header (if engine has entries) + engine entries
+    # Build final display: shell entries + section entries
     parts = []
     if shell_content:
         parts.append(shell_content)
-    if display_entries:
-        for entry in display_entries:
-            parts.append(entry)
+    parts.extend(display_lines)
     display_content = "\n".join(parts)
 
     # Update the log display marker
